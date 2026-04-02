@@ -387,12 +387,27 @@ class Decompiler:
             op = get_op(ins[i])
             return Op.JMPNE <= op <= max_op
 
+        my_target = pc + 1 + get_s(ins[pc])
+
+        def related_target(other_pc):
+            """Check if another conditional jump has a related target (same end or body)."""
+            other_target = other_pc + 1 + get_s(ins[other_pc])
+            # Same target = and chain
+            # One targets the body start (other_pc+1) = or chain
+            # My target is the body start (other_pc+1) = or chain
+            return (other_target == my_target or
+                    other_target == my_target or
+                    my_target == other_pc + 1 or
+                    other_target == pc + 1)
+
         # Check pc+2
-        if pc + 2 < N and is_cond(pc + 2) and self._same_line(chunk, pc + 2, pc):
-            return pc + 2
+        if pc + 2 < N and is_cond(pc + 2):
+            if self._same_line(chunk, pc + 2, pc) or related_target(pc + 2):
+                return pc + 2
         # Check pc+3
-        if pc + 3 < N and is_cond(pc + 3) and self._same_line(chunk, pc + 3, pc):
-            return pc + 3
+        if pc + 3 < N and is_cond(pc + 3):
+            if self._same_line(chunk, pc + 3, pc) or related_target(pc + 3):
+                return pc + 3
         return -1
 
     def _find_next_condition_pref_jmp(self, chunk, pc):
