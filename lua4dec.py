@@ -410,6 +410,111 @@ class Decompiler:
                 return pc + 3
         return -1
 
+    def _find_compound_chain(self, chunk, first_pc):
+        """Find compound (A and B) or (C and D) chains that _find_next_condition misses.
+
+        Returns None if the chain starting at first_pc is not a compound pattern.
+        Returns a list of (pc, is_or) tuples for the full compound chain if found.
+
+        The compound pattern has AND-failure jumps that go to the start of the
+        next OR-group. _find_next_condition can't follow these because the
+        target is on a different line and targets don't match.
+        """
+        ins = chunk.instructions
+        N = len(ins)
+
+        def is_cond(i):
+            if i < 0 or i >= N:
+                return False
+            op = get_op(ins[i])
+            return Op.JMPNE <= op <= Op.JMPONF
+
+        # First, walk the sequential chain
+        seq_chain = [first_pc]
+        nxt = self._find_next_condition(chunk, first_pc, include_jmp=False)
+        while nxt >= 0 and nxt not in seq_chain:
+            seq_chain.append(nxt)
+            nxt = self._find_next_condition(chunk, nxt, include_jmp=False)
+
+        # Find the body_start: the most common forward target among seq_chain
+        # members that's near the chain end
+        last_seq = seq_chain[-1]
+        target_counts = {}
+        for cpc in seq_chain:
+            t = cpc + 1 + get_s(ins[cpc])
+            if t > last_seq and t <= last_seq + 20:
+                target_counts[t] = target_counts.get(t, 0) + 1
+        if target_counts:
+            body_start = max(target_counts, key=lambda t: (target_counts[t], t))
+        else:
+            body_start = last_seq + 1
+
+        # Try to expand: follow AND-failure jump targets that land BEFORE body_start
+        chain = list(seq_chain)
+        chain_set = set(chain)
+        changed = True
+        while changed:
+            changed = False
+            for cpc in list(chain):
+                target = cpc + 1 + get_s(ins[cpc])
+                if target in chain_set or target < first_pc or target >= body_start:
+                    continue
+                # Look for a condition at or near the target
+                for delta in [0, 2, 3]:
+                    tpc = target + delta
+                    if tpc >= body_start:
+                        break
+                    if tpc < N and is_cond(tpc) and tpc not in chain_set:
+                        chain.append(tpc)
+                        chain_set.add(tpc)
+                        changed = True
+                        # Walk sequential neighbors before body_start
+                        walk = tpc
+                        while True:
+                            found_next = False
+                            for d2 in [2, 3]:
+                                npc = walk + d2
+                                if (npc < N and npc < body_start and
+                                        is_cond(npc) and npc not in chain_set):
+                                    chain.append(npc)
+                                    chain_set.add(npc)
+                                    walk = npc
+                                    found_next = True
+                                    break
+                            if not found_next:
+                                break
+                        break
+
+        if len(chain) <= len(seq_chain):
+            return None  # no expansion found
+
+        # Sort and classify each condition
+        chain.sort()
+        last_pc = chain[-1]
+
+        # Recompute body_start with the full chain
+        all_targets = set()
+        for cpc in chain:
+            all_targets.add(cpc + 1 + get_s(ins[cpc]))
+        # body_start: smallest target past the chain, not in chain
+        body_candidates = [t for t in all_targets
+                          if t not in chain_set and t > last_pc and t <= last_pc + 20]
+        if body_candidates:
+            body_start = min(body_candidates)
+        else:
+            body_start = last_pc + 1
+
+        # Classify: target == body_start → OR-success (is_or=True)
+        #           target in chain_set → AND-failure (is_or=False, invert)
+        #           else → AND-failure skip (is_or=False, invert)
+        result = []
+        for cpc in chain:
+            t = cpc + 1 + get_s(ins[cpc])
+            is_or = (t == body_start)
+            result.append((cpc, is_or))
+
+        return result
+
     def _find_next_condition_pref_jmp(self, chunk, pc):
         """FindNextCondition_PrefJMP: prefers jump target, then pc+2, pc+3."""
         ins = chunk.instructions
@@ -488,6 +593,68 @@ class Decompiler:
         if my_target <= last_cond_end:
             return True  # or: jumps to body
         return False  # and: jumps past body
+
+    @staticmethod
+    def _parenthesize_compound(cond_text):
+        """Add parentheses around AND groups in compound OR-of-AND conditions.
+
+        Input:  '(A) and (B) or (C) and (D)'
+        Output: '((A) and (B)) or ((C) and (D))'
+        """
+        # Split on ' or ' to get groups
+        parts = cond_text.split(' or ')
+        if len(parts) <= 1:
+            return cond_text
+        # Wrap groups that contain ' and ' in parens
+        wrapped = []
+        for part in parts:
+            part = part.strip()
+            if ' and ' in part:
+                wrapped.append('(' + part + ')')
+            else:
+                wrapped.append(part)
+        return ' or '.join(wrapped)
+
+    @staticmethod
+    def _add_grouping_parens(cond_text):
+        """Add parentheses when condition has mixed and/or without grouping.
+
+        Handles both patterns:
+          OR-of-ANDs: '(A) and (B) or (C) and (D)' → '((A) and (B)) or ((C) and (D))'
+          AND-of-ORs: '(A) or (B) or (C) and (D) or (E)' → '((A) or (B) or (C)) and ((D) or (E))'
+        """
+        if ' and ' not in cond_text or ' or ' not in cond_text:
+            return cond_text  # no mixing, no grouping needed
+
+        # Determine which pattern: count transitions between and/or
+        # Split into tokens, find the connectors
+        # Use a simple approach: split on ' or ' first, check if pieces have ' and '
+        or_parts = cond_text.split(' or ')
+        and_parts = cond_text.split(' and ')
+
+        if len(or_parts) > len(and_parts):
+            # More OR segments → AND-of-ORs: group OR segments, join with AND
+            # Split on ' and ' to get the AND groups
+            groups = cond_text.split(' and ')
+            wrapped = []
+            for g in groups:
+                g = g.strip()
+                if ' or ' in g:
+                    wrapped.append('(' + g + ')')
+                else:
+                    wrapped.append(g)
+            return ' and '.join(wrapped)
+        else:
+            # More AND segments → OR-of-ANDs: group AND segments, join with OR
+            groups = cond_text.split(' or ')
+            wrapped = []
+            for g in groups:
+                g = g.strip()
+                if ' and ' in g:
+                    wrapped.append('(' + g + ')')
+                else:
+                    wrapped.append(g)
+            return ' or '.join(wrapped)
 
     def _find_elseif_presence(self, chunk, pc):
         """Check if this conditional jump is an elseif."""
@@ -679,6 +846,7 @@ class Decompiler:
 
         # Condition accumulator for compound conditions
         cond_str = ''
+        compound_info = None  # list of (pc, is_or) from _find_compound_chain
 
         # Do-end blocks
         do_pcs, end_pcs_do = self._find_do_end_blocks(chunk)
@@ -1197,64 +1365,110 @@ class Decompiler:
                     pc += 1
                     continue
 
+                # Check for compound (A and B) or (C and D) pattern at first cond
+                if not compound_info and cond_str == '':
+                    compound_info = self._find_compound_chain(chunk, pc)
+
                 # Build condition text
                 jt = jump_types[-1]
-                if jt == 'c':
-                    if self._find_or_presence(chunk, pc):
-                        # 'or': don't reverse condition
-                        right = peek(0).text
-                        left = peek(1).text
-                        cond_str += f'({left}{cmp_op}{right}) or '
-                    else:
-                        # 'and': reverse condition
-                        rev_op = CMP_REVERSE.get(cmp_op, cmp_op)
-                        right = peek(0).text
-                        left = peek(1).text
-                        cond_str += f'({left}{rev_op}{right}) and '
-                else:  # while
-                    if self._find_or_presence(chunk, pc) or next_cond < 0:
-                        rev_op = CMP_REVERSE.get(cmp_op, cmp_op)
-                        right = peek(0).text
-                        left = peek(1).text
-                        cond_str += f'({left}{rev_op}{right}) and '
-                    else:
-                        right = peek(0).text
-                        left = peek(1).text
-                        cond_str += f'({left}{cmp_op}{right}) or '
+                right = peek(0).text
+                left = peek(1).text
 
-                if next_cond >= 0:
-                    # More conditions follow, don't emit yet
-                    jump_types.pop()
-                else:
-                    # Last condition in chain, emit the statement
-                    jt = jump_types[-1]
-                    # Trim trailing ' and ' or ' or '
-                    cond_text = cond_str.rstrip()
-                    if cond_text.endswith(' and'):
-                        cond_text = cond_text[:-4]
-                    elif cond_text.endswith(' or'):
-                        cond_text = cond_text[:-3]
-
-                    is_elseif = self._find_elseif_presence(chunk, pc)
-                    prefix = 'else' if is_elseif else ''
+                if compound_info:
+                    # COMPOUND PATH: use structural classification
+                    ci_dict = {cpc: ior for cpc, ior in compound_info}
+                    ci_pcs = [cpc for cpc, _ in compound_info]
+                    is_or_compound = ci_dict.get(pc, False)
+                    is_last = (pc == ci_pcs[-1])
 
                     if jt == 'c':
-                        emit(f'{prefix}if {cond_text} then', semi=False)
+                        if is_or_compound:
+                            cond_str += f'({left}{cmp_op}{right}) or '
+                        else:
+                            rev_op = CMP_REVERSE.get(cmp_op, cmp_op)
+                            cond_str += f'({left}{rev_op}{right}) and '
+                    else:  # while — flip sense
+                        if not is_or_compound:
+                            cond_str += f'({left}{cmp_op}{right}) or '
+                        else:
+                            rev_op = CMP_REVERSE.get(cmp_op, cmp_op)
+                            cond_str += f'({left}{rev_op}{right}) and '
+
+                    if not is_last:
+                        jump_types.pop()
                     else:
-                        emit(f'{prefix}while {cond_text} do', semi=False)
+                        # Emit compound condition
+                        jt = jump_types[-1]
+                        cond_text = cond_str.rstrip()
+                        if cond_text.endswith(' and'):
+                            cond_text = cond_text[:-4]
+                        elif cond_text.endswith(' or'):
+                            cond_text = cond_text[:-3]
+                        # Add parentheses around AND groups separated by OR
+                        cond_text = self._parenthesize_compound(cond_text)
 
-                    level += 1
-                    cond_str = ''
+                        is_elseif = self._find_elseif_presence(chunk, pc)
+                        prefix = 'else' if is_elseif else ''
 
-                    # Track where 'end' goes
-                    target = pc + 1 + get_s(ins)
-                    if target < N:
-                        target_ins = ins_list[target - 1] if target > 0 else 0
-                        target_op = get_op(target_ins) if target > 0 else Op.END
-                        if target_op != Op.JMP:
-                            # No else block, add end position
-                            end_positions.append(target + 1)  # convert to vb_pc
-                        # else: JMP handler will add end via else tracking
+                        if jt == 'c':
+                            emit(f'{prefix}if {cond_text} then', semi=False)
+                        else:
+                            emit(f'{prefix}while {cond_text} do', semi=False)
+
+                        level += 1
+                        cond_str = ''
+                        compound_info = None
+
+                        target = pc + 1 + get_s(ins)
+                        if target < N:
+                            target_ins = ins_list[target - 1] if target > 0 else 0
+                            target_op = get_op(target_ins) if target > 0 else Op.END
+                            if target_op != Op.JMP:
+                                end_positions.append(target + 1)
+                else:
+                    # NORMAL PATH: use _find_or_presence
+                    if jt == 'c':
+                        if self._find_or_presence(chunk, pc):
+                            cond_str += f'({left}{cmp_op}{right}) or '
+                        else:
+                            rev_op = CMP_REVERSE.get(cmp_op, cmp_op)
+                            cond_str += f'({left}{rev_op}{right}) and '
+                    else:  # while
+                        if self._find_or_presence(chunk, pc) or next_cond < 0:
+                            rev_op = CMP_REVERSE.get(cmp_op, cmp_op)
+                            cond_str += f'({left}{rev_op}{right}) and '
+                        else:
+                            cond_str += f'({left}{cmp_op}{right}) or '
+
+                    if next_cond >= 0:
+                        jump_types.pop()
+                    else:
+                        jt = jump_types[-1]
+                        cond_text = cond_str.rstrip()
+                        if cond_text.endswith(' and'):
+                            cond_text = cond_text[:-4]
+                        elif cond_text.endswith(' or'):
+                            cond_text = cond_text[:-3]
+                        # Add grouping parentheses for mixed and/or
+                        cond_text = self._add_grouping_parens(cond_text)
+
+                        is_elseif = self._find_elseif_presence(chunk, pc)
+                        prefix = 'else' if is_elseif else ''
+
+                        if jt == 'c':
+                            emit(f'{prefix}if {cond_text} then', semi=False)
+                        else:
+                            emit(f'{prefix}while {cond_text} do', semi=False)
+
+                        level += 1
+                        cond_str = ''
+
+                        target = pc + 1 + get_s(ins)
+                        if target < N:
+                            target_ins = ins_list[target - 1] if target > 0 else 0
+                            target_op = get_op(target_ins) if target > 0 else Op.END
+                            if target_op != Op.JMP:
+                                end_positions.append(target + 1)
 
                 pop_val(2)
 
@@ -1289,6 +1503,8 @@ class Decompiler:
                     while '  ' in cond_text:
                         cond_text = cond_text.replace('  ', ' ')
                     cond_text = cond_text.strip()
+                    # Add grouping parentheses for mixed and/or
+                    cond_text = self._add_grouping_parens(cond_text)
 
                     is_elseif = self._find_elseif_presence(chunk, pc)
                     prefix = 'else' if is_elseif else ''
