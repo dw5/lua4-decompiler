@@ -549,6 +549,59 @@ class Decompiler:
                                 break
                         break
 
+        # Bug 3: OR-led compound `if (a OP x) or (<AND-group>) then BODY`.
+        # The leading comparison is a TRUE-exit whose jump targets BODY directly
+        # (operator KEPT); the trailing AND members are FALSE-exits to a shared
+        # END past the body (operators inverted). _find_next_condition / the
+        # expansion loop can't bridge a BODY-target to an END-target, so the OR
+        # member is misclassified as AND and the OR is dropped. Scan the whole
+        # condition region [pcA, BODY) directly and classify each member by its
+        # jump target: target==BODY -> OR (keep op), target==END -> AND (invert).
+        if Op.JMPNE <= get_op(ins[first_pc]) <= Op.JMPGE:
+            a_pc = first_pc
+            a_target = a_pc + 1 + get_s(ins[a_pc])       # prospective BODY start
+
+            def _is_stmt(i):
+                o = get_op(ins[i])
+                return (o == Op.RETURN or Op.SETLOCAL <= o <= Op.SETMAP
+                        or (o == Op.CALL and get_b(ins[i]) == 0))
+
+            # a_target must be a forward, local BODY start (a TRUE-exit target).
+            if a_pc + 1 < a_target <= min(N, a_pc + 80):
+                members = []
+                ok = True
+                for q in range(a_pc, a_target):
+                    o = get_op(ins[q])
+                    if q != a_pc and _is_stmt(q):
+                        ok = False           # a statement => a_target is not a
+                        break                # pure condition's BODY (simple if)
+                    if o == Op.JMP:
+                        ok = False           # nested control flow in the region
+                        break
+                    if Op.JMPNE <= o <= Op.JMPGE:
+                        if q + 1 < N and get_op(ins[q + 1]) == Op.PUSHNILJMP:
+                            ok = False       # `x = (a<b)` value, not a branch
+                            break
+                        members.append(q)
+                    elif Op.JMPT <= o <= Op.JMPONF:
+                        ok = False           # boolean-test member: the render
+                        break                # path is comparison-only; bail
+                if ok and len(members) >= 2:
+                    tgts = [m + 1 + get_s(ins[m]) for m in members]
+                    end_tgts = set(t for t in tgts if t != a_target)
+                    or_count = sum(1 for t in tgts if t == a_target)
+                    and_count = len(members) - or_count
+                    # Exactly one shared END past BODY, an AND group of >=2
+                    # members, and at least the leading OR member -> the
+                    # `(a) or (b and c ...)` shape. (>=2 AND members excludes
+                    # `a or b` / `a or b or c`, which the normal path handles;
+                    # an empty end_tgts is `(A and B) or (C and D)`, also handled
+                    # by the existing expansion loop -> leave it alone.)
+                    if (len(end_tgts) == 1 and next(iter(end_tgts)) > a_target and
+                            and_count >= 2 and or_count >= 1):
+                        return [(m, (m + 1 + get_s(ins[m])) == a_target)
+                                for m in members]
+
         if len(chain) <= len(seq_chain):
             return None  # no expansion found
 
@@ -748,10 +801,21 @@ class Decompiler:
         if get_s(ins[pc]) < 0:
             return False
 
+        # End of THIS if-construct (where the then-body JMP lands).
+        my_target = pc + 1 + get_s(ins[pc])
+
         # Check if there's a conditional jump on the next line
         for i in range(pc + 1, min(N, pc + 10)):
             op = get_op(ins[i])
             if Op.JMPNE <= op <= Op.JMPONF:
+                # A genuine elseif test lies INSIDE the region this then-body
+                # JMP skips over (strictly before my_target). A conditional at
+                # or after my_target belongs to a SEPARATE following statement,
+                # so a real `else` IS needed here -- without this guard a
+                # next-line `if` is mistaken for an elseif and the else body
+                # merges into the then body (gamegui message/message2).
+                if i >= my_target:
+                    break
                 line_i = self._get_line_info(chunk, i)
                 line_pc = self._get_line_info(chunk, pc)
                 if line_i >= 0 and line_pc >= 0 and line_i - 1 == line_pc:
@@ -912,6 +976,9 @@ class Decompiler:
         cond_str = ''
         compound_info = None  # list of (pc, is_or) from _find_compound_chain
 
+        # Bug 4: carries `return f(args)` from a TAILCALL to its trailing RETURN
+        tailcall_expr = None
+
         # Do-end blocks
         do_pcs, end_pcs_do = self._find_do_end_blocks(chunk)
 
@@ -1052,11 +1119,15 @@ class Decompiler:
                     next_op = get_op(ins_list[pc + 1])
                     is_last = next_op in (Op.JMP, Op.END)
 
-                parts = []
-                for j in range(ret_base_0, top):
-                    parts.append(stack[j].text)
-
-                ret_str = 'return ' + ', '.join(parts) if parts else 'return'
+                if tailcall_expr is not None:
+                    # Bug 4: this RETURN belongs to a preceding TAILCALL.
+                    ret_str = f'return {tailcall_expr}'
+                    tailcall_expr = None
+                else:
+                    parts = []
+                    for j in range(ret_base_0, top):
+                        parts.append(stack[j].text)
+                    ret_str = 'return ' + ', '.join(parts) if parts else 'return'
                 if not is_last:
                     ret_str = 'do ' + ret_str + ' end'
 
@@ -1087,7 +1158,18 @@ class Decompiler:
                 # Pop everything from func_pos upward
                 top = func_pos
 
-                if loc_start_idx >= 0 and num_locals_here > 0:
+                if op == Op.TAILCALL:
+                    # `return f(args)`: the compiler emits TAILCALL then OP_RETURN.
+                    # Stash the call so the trailing RETURN prints it (the RETURN
+                    # handler owns the is_last / do..end wrapping). A tailcall
+                    # never assigns a local, so this case must come first.
+                    if pc + 1 < N and get_op(ins_list[pc + 1]) == Op.RETURN:
+                        tailcall_expr = call_expr
+                    else:
+                        # Defensive: no trailing RETURN (not expected in Lua 4.0)
+                        emit(f'return {call_expr}')
+                        emit_blank()
+                elif loc_start_idx >= 0 and num_locals_here > 0:
                     # Local assignment: local a, b = func(args)
                     names = []
                     for j in range(num_ret if num_ret > 0 else num_locals_here):
@@ -1215,24 +1297,22 @@ class Decompiler:
 
                 val_text = process_value_for_output()
 
-                # Handle multi-return assignment
+                # Multi-return assignment to existing locals. The SETLOCALs arrive
+                # in REVERSE target order (top result assigned to the last target
+                # first), so accumulate and reverse to recover the source order.
+                # (Old code emitted `c, b, a = a, f()`, which scrambled X/Y/Z and
+                # dropped the 3rd result on every multi-return coord assignment.)
                 sv = peek(0)
                 if sv.is_func_ret and sv.func_ret_count > 0:
-                    # Multi-return: accumulate names
-                    if hasattr(sv, '_accum_names'):
-                        sv._accum_names.append(name)
-                    else:
-                        sv._accum_names = [name]
+                    if not hasattr(sv, '_accum_names'):
+                        sv._accum_names = []
+                        sv._call_text = sv.text
+                    sv._accum_names.append(name)
                     sv.func_ret_count -= 1
                     if sv.func_ret_count == 0:
-                        names = ', '.join(sv._accum_names)
-                        emit(f'{names}={sv.text}')
+                        names = ', '.join(reversed(sv._accum_names))
+                        emit(f'{names}={sv._call_text}')
                         pop_val(1)
-                    else:
-                        sv.text = f'{name}, {sv.text}' if not hasattr(sv, '_orig_text') else sv._orig_text
-                        if not hasattr(sv, '_orig_text'):
-                            sv._orig_text = sv.text
-                        stack[top - 1] = sv  # update in place
                 else:
                     emit(f'{name}={val_text}')
                     pop_val(1)
@@ -1254,13 +1334,13 @@ class Decompiler:
                     pop_val(1)
                 elif sv.is_func_ret and sv.func_ret_count > 0:
                     if not hasattr(sv, '_accum_names'):
-                        sv._accum_names = [name]
-                    else:
-                        sv._accum_names.append(name)
+                        sv._accum_names = []
+                        sv._call_text = sv.text
+                    sv._accum_names.append(name)
                     sv.func_ret_count -= 1
                     if sv.func_ret_count == 0:
-                        names = ', '.join(sv._accum_names)
-                        emit(f'{names}={sv.text}')
+                        names = ', '.join(reversed(sv._accum_names))
+                        emit(f'{names}={sv._call_text}')
                         pop_val(1)
                 else:
                     val_text = process_value_for_output()
@@ -1730,6 +1810,23 @@ class Decompiler:
                 if self.debug:
                     emit(f'-- unknown opcode {op} at pc={pc}')
 
+            # Bug 1: declare a non-param local whose initializer was pushed at an
+            # EARLIER pc than its scope-open (startpc), so push_val never claimed
+            # it (e.g. a local first read by the condition that opens its scope).
+            # Runs AFTER the handler: any local a handler already owns at this pc
+            # has local_init=True and is skipped. Fires only when the value is
+            # still parked unclaimed at the local's stack slot.
+            for j in range(len(chunk.locals)):
+                loc = chunk.locals[j]
+                if loc.startpc == vb_pc and loc.startpc > 0 and not local_init[j]:
+                    s = local_slots.get(j, j)
+                    if 0 <= s < top:
+                        local_init[j] = True
+                        nm = loc.name
+                        emit(f'local {nm}={stack[s].text}')
+                        stack[s] = SVal(nm, VKind.NAME, local_name=nm,
+                                        is_local=True)
+
             pc += 1
 
         # Emit any remaining end statements
@@ -1768,11 +1865,16 @@ def main():
         sys.exit(1)
 
     if args.output:
-        with open(args.output, 'w', encoding='utf-8') as f:
+        # latin-1 (1 byte == 1 codepoint) so the string bytes read as latin-1 in
+        # _read_string round-trip verbatim. Writing utf-8 would double-encode any
+        # high byte (e.g. CP1251 Cyrillic 0xC2 -> 0xC3 0x82), corrupting the
+        # language files. ASCII output is byte-identical either way.
+        with open(args.output, 'w', encoding='latin-1') as f:
             f.write(source)
         print(f'Decompiled to {args.output}')
     else:
-        print(source)
+        # Same byte-faithfulness for piped output (e.g. `lua4dec.py x.luab | luac4 -p`).
+        sys.stdout.buffer.write(source.encode('latin-1') + b'\n')
 
 if __name__ == '__main__':
     main()
