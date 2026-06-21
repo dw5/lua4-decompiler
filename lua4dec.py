@@ -388,6 +388,8 @@ class Decompiler:
             return Op.JMPNE <= op <= max_op
 
         my_target = pc + 1 + get_s(ins[pc])
+        my_op = get_op(ins[pc])
+        my_is_cmp = Op.JMPNE <= my_op <= Op.JMPGE
 
         def related_target(other_pc):
             """Check if another conditional jump has a related target (same end or body)."""
@@ -396,18 +398,80 @@ class Decompiler:
             # One targets the body start (other_pc+1) = or chain
             # My target is the body start (other_pc+1) = or chain
             return (other_target == my_target or
-                    other_target == my_target or
                     my_target == other_pc + 1 or
                     other_target == pc + 1)
 
+        def same_cond_type(other_pc):
+            """Cross-line chaining only allowed between same-type conditions.
+
+            Comparison ops (JMPNE..JMPGE) chain with comparisons,
+            boolean tests (JMPT/JMPF/JMPONT/JMPONF) chain with boolean tests.
+            Mixing types across lines indicates nested ifs, not compound conditions.
+            """
+            other_op = get_op(ins[other_pc])
+            other_is_cmp = Op.JMPNE <= other_op <= Op.JMPGE
+            return my_is_cmp == other_is_cmp
+
         # Check pc+2
         if pc + 2 < N and is_cond(pc + 2):
-            if self._same_line(chunk, pc + 2, pc) or related_target(pc + 2):
+            if self._same_line(chunk, pc + 2, pc):
+                return pc + 2
+            if same_cond_type(pc + 2) and related_target(pc + 2):
                 return pc + 2
         # Check pc+3
         if pc + 3 < N and is_cond(pc + 3):
-            if self._same_line(chunk, pc + 3, pc) or related_target(pc + 3):
+            if self._same_line(chunk, pc + 3, pc):
                 return pc + 3
+            if same_cond_type(pc + 3) and related_target(pc + 3):
+                return pc + 3
+        # Extended forward scan: an operand may span several instructions (e.g.
+        # a function call between OR operands across source lines), pushing the
+        # next condition's jump beyond pc+3. For a forward jump, scan the operand
+        # region (up to this jump's own target, which is the then-body / else)
+        # for the next conditional jump and accept it if it relates as a compound
+        # member. Stop at the first conditional jump: if it doesn't qualify, the
+        # region is a body, not a continued condition.
+        # Extended forward scan: an operand may span several instructions (e.g.
+        # a function call between OR operands across source lines), pushing the
+        # next condition's jump beyond pc+3. Scan the operand region for the next
+        # conditional jump. Two relations identify a sibling OR member:
+        #   q_target == my_target  -> both jump into the SAME body (OR-success run,
+        #                             e.g. `A or B or C` where A,B,C all -> body)
+        #   q + 1   == my_target   -> q is the final condition and the body begins
+        #                             right after it (`A or B` -> body at B+1)
+        # Guard: a store/return op before q is a statement boundary, meaning q
+        # lives in a BODY (a nested if), not a continued condition — stop. This
+        # is what distinguishes a real compound `or` from a trailing nested if.
+        def is_stmt(i):
+            o = get_op(ins[i])
+            if o == Op.RETURN or Op.SETLOCAL <= o <= Op.SETMAP:
+                return True
+            # A result-discarding call (CALL with 0 wanted results) is a
+            # statement, not an operand — a body of only `Cmd(...)`/`msg(...)`
+            # calls must still count as a body boundary.
+            if o == Op.CALL and get_b(ins[i]) == 0:
+                return True
+            return False
+
+        if my_target > pc + 1:
+            for q in range(pc + 1, min(my_target, N)):
+                if is_stmt(q):
+                    break  # entered a body, not a continued condition
+                if is_cond(q):
+                    if same_cond_type(q):
+                        q_target = q + 1 + get_s(ins[q])
+                        if q + 1 == my_target:
+                            # q is the final/closing member; body begins at q+1
+                            return q
+                        if q_target == my_target and not any(
+                                is_stmt(r) for r in range(pc + 1, min(my_target, N))):
+                            # q shares this jump's target. That's an OR-success run
+                            # (`A or B or C` all -> body_start) ONLY if no statement
+                            # lies between here and that target; otherwise the
+                            # shared target is PAST a body and this is a nested
+                            # if / `and`, which must NOT be fused.
+                            return q
+                    break  # first cond didn't qualify -> not a compound member
         return -1
 
     def _find_compound_chain(self, chunk, first_pc):
